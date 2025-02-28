@@ -1,105 +1,157 @@
-import sys
-import re
-import os
-import subprocess
+from collections.abc import Mapping
+import readline
 import shlex
+import subprocess
+import sys
+import pathlib
+import os
+from typing import Final, TextIO
 
-BUILDIN_KEYWORDS = [
+SHELL_BUILTINS: Final[list[str]] = [
     "echo",
     "exit",
     "type",
     "pwd",
     "cd",
 ]
-ECHO_PATTERN = re.compile(r"^echo ")
-TYPE_PATTERN = re.compile(r"^type ")
-CD_PATTERN = re.compile(r"^cd ")
-CAT_PATTERN = re.compile(r"^cat ")
 
+def parse_programs_in_path(path: str, programs: dict[str, pathlib.Path]) -> None:
+    """Creates a mapping of programs in path to their paths"""
+    try:
+        path_obj = pathlib.Path(path)
+        if path_obj.exists() and path_obj.is_dir():
+            for item in path_obj.iterdir():
+                if item.is_file() and os.access(item, os.X_OK):
+                    # Only add the program if it doesn't already exist in the programs dict
+                    # This ensures we respect PATH order (first occurrence wins)
+                    if item.name not in programs:
+                        programs[item.name] = item
+    except Exception:
+        pass
 
-def _is_builtin(keyword: str) -> bool:
-    return keyword in BUILDIN_KEYWORDS
+def generate_program_paths() -> Mapping[str, pathlib.Path]:
+    programs: dict[str, pathlib.Path] = {}
+    for p in (os.getenv("PATH") or "").split(":"):
+        parse_programs_in_path(p, programs)
+    return programs
 
+def refresh_programs_in_path() -> Mapping[str, pathlib.Path]:
+    """Refreshes the programs in PATH to ensure we have the latest"""
+    return generate_program_paths()
 
-def _find_in_path(param: str) -> str:
-    # Resolve both absolute and relative paths
-    if os.path.isfile(param) and os.access(param, os.X_OK):
-        return os.path.abspath(param)
-    paths = os.getenv("PATH", "").split(os.pathsep)
-    for path in paths:
-        executable_path = os.path.join(path, param)
-        if os.path.isfile(executable_path) and os.access(executable_path, os.X_OK):
-            return executable_path
-    return None
+COMPLETIONS: Final[list[str]] = [*SHELL_BUILTINS]
 
+def display_matches(substitution, matches, longest_match_length):
+    print()
+    if matches:
+        print("  ".join(matches))
+    print("$ " + substitution, end="")
+
+def complete(text: str, state: int) -> str | None:
+    programs = refresh_programs_in_path()
+    all_completions = [*SHELL_BUILTINS, *programs.keys()]
+    matches = list(set([s for s in all_completions if s.startswith(text)]))
+    if len(matches) == 1:
+        return matches[state] + " " if state < len(matches) else None
+    return matches[state] if state < len(matches) else None
+
+readline.set_completion_display_matches_hook(display_matches)
+readline.parse_and_bind("tab: complete")
+readline.set_completer(complete)
 
 def main():
     while True:
         sys.stdout.write("$ ")
-        sys.stdout.flush()
-        command = input()
-
-        if command == "exit 0":
-            break
-
-        # Parse command with shlex to handle quoted strings properly
+        cmds = shlex.split(input())
+        out = sys.stdout
+        err = sys.stderr
+        close_out = False
+        close_err = False
         try:
-            cmd_list = shlex.split(command, posix=True)
-        except ValueError as e:
-            sys.stdout.write(f"Error parsing command: {e}\n")
-            continue
+            if ">" in cmds:
+                out_index = cmds.index(">")
+                out = open(cmds[out_index + 1], "w")
+                close_out = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            elif "1>" in cmds:
+                out_index = cmds.index("1>")
+                out = open(cmds[out_index + 1], "w")
+                close_out = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            if "2>" in cmds:
+                out_index = cmds.index("2>")
+                err = open(cmds[out_index + 1], "w")
+                close_err = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            if ">>" in cmds:
+                out_index = cmds.index(">>")
+                out = open(cmds[out_index + 1], "a")
+                close_out = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            elif "1>>" in cmds:
+                out_index = cmds.index("1>>")
+                out = open(cmds[out_index + 1], "a")
+                close_out = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            if "2>>" in cmds:
+                out_index = cmds.index("2>>")
+                err = open(cmds[out_index + 1], "a")
+                close_err = True
+                cmds = cmds[:out_index] + cmds[out_index + 2 :]
+            handle_all(cmds, out, err)
+        finally:
+            if close_out:
+                out.close()
+            if close_err:
+                err.close()
 
-        if not cmd_list:
-            continue
-
-        cmd = cmd_list[0]
-        args = cmd_list[1:]
-
-        # Handle built-in commands
-        if cmd == "pwd":
-            sys.stdout.write(f"{os.getcwd()}\n")
-        elif cmd == "exit":
-            code = int(args[0]) if args else 0
-            sys.exit(code)
-        elif cmd == "echo":
-            sys.stdout.write(" ".join(args) + "\n")
-        elif cmd == "cd":
-            if not args:
-                sys.stdout.write("cd: missing argument\n")
+def handle_all(cmds: list[str], out: TextIO, err: TextIO):
+    # Wait for user input
+    match cmds:
+        case ["echo", *s]:
+            out.write(" ".join(s) + "\n")
+        case ["type", s]:
+            type_command(s, out, err)
+        case ["exit", "0"]:
+            sys.exit(0)
+        case ["pwd"]:
+            out.write(f"{os.getcwd()}\n")
+        case ["cd", dir]:
+            cd(dir, out, err)
+        case [cmd, *args]:
+            # Always refresh the programs in PATH before executing
+            programs = refresh_programs_in_path()
+            if cmd in programs:
+                # Pass the program name (cmd) as argv[0], not the full path
+                process = subprocess.Popen([cmd, *args], stdout=out, stderr=err)
+                process.wait()
             else:
-                path = args[0]
-                try:
-                    os.chdir(os.path.expanduser(path))
-                except FileNotFoundError:
-                    sys.stdout.write(f"cd: {path}: No such file or directory\n")
-                except NotADirectoryError:
-                    sys.stdout.write(f"cd: {path}: Not a directory\n")
-                except PermissionError:
-                    sys.stdout.write(f"cd: {path}: Permission denied\n")
-        elif cmd == "type":
-            if not args:
-                sys.stdout.write("type: missing argument\n")
-            else:
-                name = args[0]
-                if _is_builtin(name):
-                    sys.stdout.write(f"{name} is a shell builtin\n")
-                elif executable := _find_in_path(name):
-                    sys.stdout.write(f"{name} is {executable}\n")
-                else:
-                    sys.stdout.write(f"{name}: not found\n")
-        else:
-            # Handle external commands, including quoted executables
-            executable_path = _find_in_path(cmd)
-            if executable_path:
-                try:
-                    subprocess.run([executable_path, *args])
-                except FileNotFoundError:
-                    sys.stdout.write(f"{cmd}: command not found\n")
-                except PermissionError:
-                    sys.stdout.write(f"{cmd}: Permission denied\n")
-            else:
-                sys.stdout.write(f"{cmd}: command not found\n")
+                out.write(f"{cmd}: command not found\n")
+        case command:
+            out.write(f"{' '.join(command)}: command not found\n")
 
+def type_command(command: str, out: TextIO, err: TextIO):
+    if command in SHELL_BUILTINS:
+        out.write(f"{command} is a shell builtin\n")
+        return
+    
+    # Always refresh the programs in PATH before checking
+    programs = refresh_programs_in_path()
+    if command in programs:
+        out.write(f"{command} is {programs[command]}\n")
+        return
+    
+    out.write(f"{command}: not found\n")
+
+def cd(path: str, out: TextIO, err: TextIO) -> None:
+    if path.startswith("~"):
+        home = os.getenv("HOME") or "/root"
+        path = path.replace("~", home)
+    p = pathlib.Path(path)
+    if not p.exists():
+        err.write(f"cd: {path}: No such file or directory\n")
+        return
+    os.chdir(p)
 
 if __name__ == "__main__":
     main()
